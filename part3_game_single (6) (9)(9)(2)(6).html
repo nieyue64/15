@@ -25335,6 +25335,8 @@ class Game {
     });
     this._runFrameTasks(logicTasks, logicBudgetMs, perf);
     window.GameEvents && window.GameEvents.emit && window.GameEvents.emit('game:update:post', this, dtMs, dtClamped, dtScale);
+    // BUGFIX: Record tick end for accurate perf baseline tracking
+    this._loopTickEnd = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
   }
   _resetMiningState() {
     if (0 === this.miningProgress && -1 === this._miningTargetX && -1 === this._miningTargetY) return;
@@ -28478,8 +28480,8 @@ window.TU;
   // Extend SaveSystem.markTile to notify tile logic
   try {
     const SS = void 0 !== SaveSystem ? SaveSystem : TU.SaveSystem || null;
-    if (SS && SS.prototype && !SS.prototype.__logicMarkTilePatched) {
-      SS.prototype.__logicMarkTilePatched = !0;
+    // BUGFIX: __logicMarkTilePatched DISABLED -- version bumping now in native markTile (avoids double-increment)
+    if (false /* merged into native markTile */) {
       const _mark = SS.prototype.markTile;
       SS.prototype.markTile = function (x, y, newId) {
         const r = _mark.apply(this, arguments),
@@ -29478,14 +29480,8 @@ window.TU;
           } catch(e){console.warn('[Catch]',e);}
         }
         // Phase 4: Hook BlockRegistry into block allocation for deterministic ID mapping
-        const _origAddBlock = addBlock;
+        // IDs are registered by unique name so that palette can be exported/imported for save migration.
         const _br = window.BlockRegistry;
-        const addBlockRegistered = function(id, def) {
-          if (_br && def && def.name) {
-            _br.register(def.name, id);
-          }
-          return _origAddBlock(id, def);
-        };
         IDS.PUMP_IN || (IDS.PUMP_IN = _br ? _br.register('PUMP_IN', allocId(206)) : allocId(206));
         IDS.PUMP_OUT || (IDS.PUMP_OUT = _br ? _br.register('PUMP_OUT', allocId(1 + (0 | IDS.PUMP_IN))) : allocId(1 + (0 | IDS.PUMP_IN)));
         IDS.PLATE_OFF || (IDS.PLATE_OFF = _br ? _br.register('PLATE_OFF', allocId(1 + (0 | IDS.PUMP_OUT))) : allocId(1 + (0 | IDS.PUMP_OUT)));
