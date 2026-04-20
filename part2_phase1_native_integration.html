@@ -5234,173 +5234,6 @@ window.AppServices = new class ServiceLocator {
   }
 }();
 
-// ============================================================================
-// Phase 4: StorageAdapter - Unified localStorage/IDB degradation chain
-// ============================================================================
-window.StorageAdapter = new class StorageAdapter {
-  constructor() {
-    this._mode = 'ls'; // 'ls' | 'idb' | 'memory'
-    this._memoryFallback = new Map();
-    this._idbReady = false;
-    this._idb = null;
-    this._quotaExceeded = false;
-    this._degradedReason = null;
-  }
-
-  /** Get current storage mode */
-  get mode() { return this._mode; }
-  get isDegraded() { return this._mode !== 'ls'; }
-  get degradedReason() { return this._degradedReason; }
-
-  /** Try to get a value, falling through LS -> IDB -> Memory */
-  get(key) {
-    if (this._mode === 'ls' || this._mode === 'idb') {
-      try {
-        const val = localStorage.getItem(key);
-        if (val !== null) return val;
-      } catch (e) {
-        // LS failed, try degrading
-      }
-    }
-    if (this._mode === 'memory') {
-      return this._memoryFallback.get(key) || null;
-    }
-    return null;
-  }
-
-  /** Try to set a value, with degradation on quota exceeded */
-  set(key, value) {
-    try {
-      localStorage.setItem(key, value);
-      return true;
-    } catch (e) {
-      if (e && e.name === 'QuotaExceededError') {
-        this._quotaExceeded = true;
-        this._degradedReason = 'quota';
-        // Explicitly surface the error (Phase 0 requirement: no silent swallowing)
-        console.warn('[StorageAdapter] QuotaExceededError on key "' + key + '", degrading to IDB/memory');
-        if (window.TU_GlobalErrorBoundary) {
-          window.TU_GlobalErrorBoundary.report('StorageAdapter', e, { key, mode: this._mode });
-        }
-        // Try IDB fallback
-        if (this._idb) {
-          this._mode = 'idb';
-          try { this._idb.set(key, value); return true; } catch (_) {}
-        }
-        // Final fallback: in-memory
-        this._mode = 'memory';
-        this._memoryFallback.set(key, value);
-        return false;
-      }
-      console.warn('[StorageAdapter] set failed:', e);
-      return false;
-    }
-  }
-
-  /** Remove a key */
-  remove(key) {
-    try { localStorage.removeItem(key); } catch (_) {}
-    this._memoryFallback.delete(key);
-    return true;
-  }
-
-  /** Attach an IDB instance for fallback */
-  setIDB(idbInstance) {
-    this._idb = idbInstance;
-    this._idbReady = true;
-  }
-
-  /** Get stats for debugging */
-  getStats() {
-    return {
-      mode: this._mode,
-      isDegraded: this.isDegraded,
-      degradedReason: this._degradedReason,
-      quotaExceeded: this._quotaExceeded,
-      memoryKeys: this._memoryFallback.size,
-      idbReady: this._idbReady
-    };
-  }
-}();
-
-// ============================================================================
-// Phase 4: BlockRegistry - Deterministic block ID assignment with palette mapping
-// ============================================================================
-window.BlockRegistry = new class BlockRegistry {
-  constructor() {
-    // name -> id mapping (the "palette")
-    this._nameToId = new Map();
-    this._idToName = new Map();
-    this._frozen = false;
-  }
-
-  /**
-   * Register a block with a deterministic name-to-ID mapping.
-   * If the name was previously registered, returns the existing ID.
-   * @param {string} name - Unique block name (e.g., 'PUMP_IN')
-   * @param {number} preferredId - Preferred ID to use if not yet taken
-   * @returns {number} The assigned ID
-   */
-  register(name, preferredId) {
-    if (this._nameToId.has(name)) return this._nameToId.get(name);
-    let id = preferredId;
-    // If preferred ID is taken, find next free
-    if (this._idToName.has(id)) {
-      for (let i = preferredId + 1; i < 255; i++) {
-        if (!this._idToName.has(i)) { id = i; break; }
-      }
-    }
-    this._nameToId.set(name, id);
-    this._idToName.set(id, name);
-    return id;
-  }
-
-  /** Get ID by name */
-  getId(name) { return this._nameToId.get(name); }
-
-  /** Get name by ID */
-  getName(id) { return this._idToName.get(id); }
-
-  /**
-   * Export palette for save header embedding.
-   * Returns { name: id } object for serialization.
-   */
-  exportPalette() {
-    const palette = {};
-    for (const [name, id] of this._nameToId) palette[name] = id;
-    return palette;
-  }
-
-  /**
-   * Import palette from save header. Builds remap table for ID migration.
-   * @param {Object} savedPalette - { name: savedId }
-   * @returns {Map<number, number>} remap table (savedId -> currentId)
-   */
-  importPalette(savedPalette) {
-    const remap = new Map();
-    if (!savedPalette || typeof savedPalette !== 'object') return remap;
-    for (const name in savedPalette) {
-      const savedId = 0 | savedPalette[name];
-      const currentId = this._nameToId.get(name);
-      if (currentId !== undefined && savedId !== currentId) {
-        remap.set(savedId, currentId);
-      }
-    }
-    return remap;
-  }
-
-  /** Freeze the registry to prevent further registration */
-  freeze() { this._frozen = true; }
-
-  /** Stats */
-  getStats() {
-    return {
-      count: this._nameToId.size,
-      frozen: this._frozen,
-      palette: this.exportPalette()
-    };
-  }
-}();
 
 window.AppServices.register('events', {
   on: function(t, e, c, o) { t.addEventListener(e, c, o); },
@@ -9658,17 +9491,7 @@ class SaveSystem {
     // Performance enhancement: also store diff into world object dynamically so generateChunk doesn't need to check game singleton
     const w = window.AppServices.get("world");
     w && (w._saveDiff = this.diff, w._saveDiffChunks = this.diffChunks);
-    // Phase 2: Natively integrated tileVersion/waterVersion bumping (formerly __logicMarkTilePatched monkey patch)
-    if (w) {
-      w._tileVersion = 1 + (0 | w._tileVersion) | 0;
-      if ((0 | newId) === (window.BLOCK && window.BLOCK.WATER || 27)) {
-        w._waterVersion = 1 + (0 | w._waterVersion) | 0;
-        if (typeof window.__tuBumpWaterChunkVer === 'function') window.__tuBumpWaterChunkVer(w, 0 | x, 0 | y);
-      }
-    }
-    // Phase 2: Emit event for decoupled listeners (machine sync, tile logic, etc.)
     try {
-      window.GameEvents && window.GameEvents.emit && window.GameEvents.emit('save:tileMarked', { x, y, newId, oldId });
       window.GameEvents && window.GameEvents.emit && window.GameEvents.emit('renderer:invalidateRegion', x, y, x, y);
     } catch(e){console.warn('[Catch]',e);}
   }
@@ -18791,8 +18614,6 @@ class Renderer {
     }
     window.GameEvents.on('block:written', e => this.invalidateTile(e.x, e.y));
     if (!this.ctx) throw Error("Canvas 2D context initialization failed");
-    // Phase 3: PostFX pipeline - linear stage array replaces onion wrapping
-    this.postFxPipeline = [];
     // Flicker detection state (pixel-based, runs first 30 frames)
     this._flickerCheckFrames = 0;
     this._flickerCheckMax = 30;
@@ -21253,20 +21074,6 @@ class Renderer {
       ctx.drawImage(fvlBuf, 0, 0);
     }
     ctx.restore();
-    // Phase 3: Run postFxPipeline stages in linear order (no more onion wrapping)
-    // Pipeline stages are { name, order, fn(renderer, time, depth01, reducedMotion) }
-    if (this.postFxPipeline && this.postFxPipeline.length) {
-      for (let _pi = 0, _pLen = this.postFxPipeline.length; _pLen > _pi; _pi++) {
-        const stage = this.postFxPipeline[_pi];
-        if (stage && typeof stage.fn === 'function') {
-          try {
-            stage.fn(this, time, depth01, reducedMotion);
-          } catch (stageErr) {
-            console.warn('[PostFxPipeline] Stage "' + (stage.name || _pi) + '" error:', stageErr);
-          }
-        }
-      }
-    }
     window.GameEvents && window.GameEvents.emit && window.GameEvents.emit('renderer:postFX:complete', this, time, depth01, reducedMotion);
   }
   /**
@@ -21276,22 +21083,6 @@ class Renderer {
    */
   postProcess(time = .5) {
     this.applyPostFX(time, 0, !1);
-  }
-  /**
-   * Phase 3: Register a named postFX pipeline stage.
-   * Stages run after the base applyPostFX in order of `order` value.
-   * @param {string} name - Unique stage name
-   * @param {number} order - Execution order (lower = earlier). Recommended: Weather=100, Underwater=200
-   * @param {Function} fn - fn(renderer, time, depth01, reducedMotion)
-   */
-  registerPostFxStage(name, order, fn) {
-    if (!this.postFxPipeline) this.postFxPipeline = [];
-    // Prevent duplicate registration
-    for (let i = 0; i < this.postFxPipeline.length; i++) {
-      if (this.postFxPipeline[i].name === name) return;
-    }
-    this.postFxPipeline.push({ name, order: +order || 0, fn });
-    this.postFxPipeline.sort((a, b) => a.order - b.order);
   }
   // Utility methods: merged from multiple patch versions for backward compatibility
   /**
@@ -25335,8 +25126,6 @@ class Game {
     });
     this._runFrameTasks(logicTasks, logicBudgetMs, perf);
     window.GameEvents && window.GameEvents.emit && window.GameEvents.emit('game:update:post', this, dtMs, dtClamped, dtScale);
-    // BUGFIX: Record tick end for accurate perf baseline tracking
-    this._loopTickEnd = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
   }
   _resetMiningState() {
     if (0 === this.miningProgress && -1 === this._miningTargetX && -1 === this._miningTargetY) return;
@@ -28480,8 +28269,8 @@ window.TU;
   // Extend SaveSystem.markTile to notify tile logic
   try {
     const SS = void 0 !== SaveSystem ? SaveSystem : TU.SaveSystem || null;
-    // BUGFIX: __logicMarkTilePatched DISABLED -- version bumping now in native markTile (avoids double-increment)
-    if (false /* merged into native markTile */) {
+    if (SS && SS.prototype && !SS.prototype.__logicMarkTilePatched) {
+      SS.prototype.__logicMarkTilePatched = !0;
       const _mark = SS.prototype.markTile;
       SS.prototype.markTile = function (x, y, newId) {
         const r = _mark.apply(this, arguments),
@@ -28698,7 +28487,7 @@ window.TU;
               this.noise(dur, dVol);
             } catch(e){console.warn('[Catch]',e);}
           }
-        }), Renderer && Renderer.prototype && false /* Phase 3: __weatherPostTintInstalled DISABLED - superseded by __weatherPostTintOptimized */) {
+        }), Renderer && Renderer.prototype && !Renderer.prototype.__weatherPostTintInstalled) {
           Renderer.prototype.__weatherPostTintInstalled = !0;
           const _orig = Renderer.prototype.applyPostFX;
           Renderer.prototype.applyPostFX = function (time, depth01, reducedMotion) {
@@ -29286,7 +29075,7 @@ window.TU;
           "function" == typeof _init && (Game.prototype.init = async function (...args) {
             const r = await _init.apply(this, args);
             try {
-              // Phase 2: REMOVED duplicate game:init:post emit (native init already emits it)
+              window.GameEvents.emit("game:init:post", this);
             } catch(e){console.warn('[Catch]',e);}
             return r;
           });
@@ -29479,13 +29268,10 @@ window.TU;
             }
           } catch(e){console.warn('[Catch]',e);}
         }
-        // Phase 4: Hook BlockRegistry into block allocation for deterministic ID mapping
-        // IDs are registered by unique name so that palette can be exported/imported for save migration.
-        const _br = window.BlockRegistry;
-        IDS.PUMP_IN || (IDS.PUMP_IN = _br ? _br.register('PUMP_IN', allocId(206)) : allocId(206));
-        IDS.PUMP_OUT || (IDS.PUMP_OUT = _br ? _br.register('PUMP_OUT', allocId(1 + (0 | IDS.PUMP_IN))) : allocId(1 + (0 | IDS.PUMP_IN)));
-        IDS.PLATE_OFF || (IDS.PLATE_OFF = _br ? _br.register('PLATE_OFF', allocId(1 + (0 | IDS.PUMP_OUT))) : allocId(1 + (0 | IDS.PUMP_OUT)));
-        IDS.PLATE_ON || (IDS.PLATE_ON = _br ? _br.register('PLATE_ON', allocId(1 + (0 | IDS.PLATE_OFF))) : allocId(1 + (0 | IDS.PLATE_OFF)));
+        IDS.PUMP_IN || (IDS.PUMP_IN = allocId(206));
+        IDS.PUMP_OUT || (IDS.PUMP_OUT = allocId(1 + (0 | IDS.PUMP_IN)));
+        IDS.PLATE_OFF || (IDS.PLATE_OFF = allocId(1 + (0 | IDS.PUMP_OUT)));
+        IDS.PLATE_ON || (IDS.PLATE_ON = allocId(1 + (0 | IDS.PLATE_OFF)));
         try {
           BD[IDS.PUMP_IN] || (addBlock(IDS.PUMP_IN, {
             name: "泵(入水口)",
